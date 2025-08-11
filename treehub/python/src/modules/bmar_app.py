@@ -10,6 +10,9 @@ import logging
 import os
 import numpy as np
 import datetime
+import sounddevice as sd
+from .audio_tools import set_global_flac_target_samplerate
+from collections import deque
 
 # Import core modules that should always be present
 from .bmar_config import *
@@ -19,7 +22,7 @@ from .platform_manager import PlatformManager
 try:
     from .file_utils import setup_directories, get_today_dir
 except ImportError:
-    logging.warning("file_utils module not available")
+    logging.warning("file_utils module not available to BMAR_app")
 
 try:
     from .audio_devices import get_audio_device_config, find_device_by_config
@@ -30,6 +33,61 @@ try:
     from .user_interface import keyboard_listener, cleanup_ui, background_keyboard_monitor
 except ImportError:
     logging.warning("user_interface module not available")
+
+# Prefer package-qualified (relative) import; warn only if truly missing
+try:
+    from .file_utils import check_and_create_date_folders
+except ImportError:
+    logging.warning("file_utils module not available to BMAR_app")
+    check_and_create_date_folders = None
+except Exception as e:
+    logging.exception("BMAR_app failed importing file_utils due to an internal error")
+    raise
+
+# Import bmar_config here for use in BmarApp
+from . import bmar_config as _cfg_mod
+
+try:
+    from .file_utils import setup_directories, get_today_dir, check_and_create_date_folders
+except ImportError:
+    logging.warning("file_utils module not available to BMAR_app")
+    setup_directories = get_today_dir = check_and_create_date_folders = None
+
+# Import core modules that should always be present
+from .bmar_config import *
+from .platform_manager import PlatformManager
+
+# Try to import other modules with fallbacks
+try:
+    from .file_utils import setup_directories, get_today_dir
+except ImportError:
+    logging.warning("file_utils module not available to BMAR_app")
+
+try:
+    from .audio_devices import get_audio_device_config, find_device_by_config
+except ImportError:
+    logging.warning("audio_devices module not available")
+
+try:
+    from .user_interface import keyboard_listener, cleanup_ui, background_keyboard_monitor
+except ImportError:
+    logging.warning("user_interface module not available")
+
+# Prefer package-qualified (relative) import; warn only if truly missing
+try:
+    from .file_utils import check_and_create_date_folders
+except ImportError:
+    logging.warning("file_utils module not available to BMAR_app")
+    check_and_create_date_folders = None
+except Exception as e:
+    logging.exception("BMAR_app failed importing file_utils due to an internal error")
+    raise
+
+# Import bmar_config here for use in BmarApp
+from . import bmar_config as _cfg_mod
+
+from .audio_devices import find_device_by_config, get_audio_device_config
+from .audio_tools import save_flac_with_target_sr
 
 class BmarApp:
     """Main BMAR Application class."""
@@ -53,8 +111,9 @@ class BmarApp:
         self.PRIMARY_IN_SAMPLERATE = 48000
         self.channels = 1
         self._bit_depth = 16
+        # Use float32 internally for buffers/processing; saving handles bit depth separately
+        self._dtype = np.int16
         self.blocksize = 1024
-        self.monitor_channel = 0
         # Default output device index for playback (intercom)
         self.output_device_index = None
         
@@ -86,8 +145,17 @@ class BmarApp:
         self.stop_auto_recording_event = threading.Event()  # For automatic recording
         self.buffer_wrap_event = threading.Event()
         
+        # VU meter state
+        self.vu_level_db = -120.0         # latest raw block dBFS
+        self.vu_level_db_smooth = -120.0  # smoothed dBFS for UI
+        self._vu_window = deque()         # rolling window of recent dB values
+        self._vu_window_len = 0           # target number of blocks in window
+        
         # Initialize platform manager
         self.platform_manager = PlatformManager()
+
+        # Ensure a config module is always available early
+        self.config = _cfg_mod
 
     def initialize(self):
         """Initialize the application components."""
@@ -123,14 +191,23 @@ class BmarApp:
             print(f"Recording directory: {self.recording_dir}")
             print(f"Today's directory: {self.today_dir}")
             
-            # Initialize audio
+            # Load audio-related settings from BMAR_config BEFORE initializing audio
+            # so the requested samplerate comes from config (e.g., 192000), not defaults.
+            self.PRIMARY_IN_SAMPLERATE = int(getattr(self.config, 'PRIMARY_IN_SAMPLERATE', 48000))
+            self.PRIMARY_BITDEPTH = int(getattr(self.config, 'PRIMARY_BITDEPTH', 16))
+            self.PRIMARY_SAVE_SAMPLERATE = getattr(self.config, 'PRIMARY_SAVE_SAMPLERATE', None)
+            # Preferred input channels from config (used as desired_ch)
+            try:
+                self.SOUND_IN_CHS = int(getattr(self.config, 'SOUND_IN_CHS', 1))
+            except Exception:
+                self.SOUND_IN_CHS = 1
+            # Ensure all FLAC writes honor PRIMARY_SAVE_SAMPLERATE
+            set_global_flac_target_samplerate(self.PRIMARY_SAVE_SAMPLERATE)
+
+            # Initialize audio (config is already set on self)
             audio_success = self.initialize_audio_with_fallback()
             if not audio_success:
                 raise RuntimeError("No suitable audio device found")
-            
-            # Import and setup config for audio processing
-            from . import bmar_config
-            self.config = bmar_config
             
             # Initialize channel to monitor and default output device from config
             try:
@@ -144,38 +221,15 @@ class BmarApp:
             
             # Set up platform-specific directory configuration
             from .bmar_config import get_platform_audio_config
-            platform_config = get_platform_audio_config(self.platform_manager, bmar_config)
-            
+            platform_config = get_platform_audio_config(self.platform_manager, _cfg_mod)
+
             # Add platform-specific attributes needed by file_utils
             self.data_drive = platform_config['data_drive']
             self.data_path = platform_config['data_path']
             self.folders = platform_config['folders']
             
-            # Set up audio processing attributes from config
-            self.PRIMARY_IN_SAMPLERATE = getattr(bmar_config, 'PRIMARY_IN_SAMPLERATE', 48000)
-            self.PRIMARY_BITDEPTH = getattr(bmar_config, 'PRIMARY_BITDEPTH', 16)
-            self.PRIMARY_SAVE_SAMPLERATE = getattr(bmar_config, 'PRIMARY_SAVE_SAMPLERATE', None)
-            self.BUFFER_SECONDS = getattr(bmar_config, 'BUFFER_SECONDS', 300)
-            
-            # Set up directory attributes for recording (these will be updated by check_and_create_date_folders)
-            self.MONITOR_DIRECTORY = os.path.join(self.today_dir, 'monitor')
-            self.PRIMARY_DIRECTORY = os.path.join(self.today_dir, 'primary')
-            self.PLOT_DIRECTORY = os.path.join(self.today_dir, 'plots')
-            
-            # Ensure recording directories exist
-            os.makedirs(self.MONITOR_DIRECTORY, exist_ok=True)
-            os.makedirs(self.PRIMARY_DIRECTORY, exist_ok=True)
-            os.makedirs(self.PLOT_DIRECTORY, exist_ok=True)
-            
-            # Set up data type based on bit depth
-            if self.PRIMARY_BITDEPTH == 16:
-                self._dtype = np.int16
-            elif self.PRIMARY_BITDEPTH == 24:
-                self._dtype = np.int32
-            elif self.PRIMARY_BITDEPTH == 32:
-                self._dtype = np.float32
-            else:
-                self._dtype = np.float32  # Default fallback
+            # Other timing/buffer settings
+            self.BUFFER_SECONDS = getattr(_cfg_mod, 'BUFFER_SECONDS', 300)
             
             # Initialize circular buffer if audio recording will be used
             if self.should_start_auto_recording():
@@ -202,42 +256,99 @@ class BmarApp:
             return False
 
     def initialize_audio_with_fallback(self) -> bool:
-        """Initialize audio system using config-specified devices."""
+        """
+        Initialize audio input. Honor PRIMARY_IN_SAMPLERATE from config if possible.
+        Falls back to device default when the requested rate is not supported.
+        """
+        configured_name = None
         try:
-            from .audio_devices import find_device_by_config, get_audio_device_config
-            
-            print("Searching for audio device specified in configuration...")
-            
-            # Try config-based device finding first
-            try:
-                if find_device_by_config(self):
-                    print(f"Audio device configured: {self.device_index} at {self.samplerate}Hz ({self.channels} channels)")
-                    return True
-            except Exception as e:
-                print(f"Config-based device configuration failed: {e}")
-                logging.info(f"Config-based device configuration failed, trying fallback: {e}")
-            
-            # Try fallback configuration
-            print("Attempting fallback audio configuration...")
-            device_config = get_audio_device_config()
-            if device_config and device_config.get('default_device'):
-                device = device_config['default_device']
-                self.device_index = device['index']
-                self.samplerate = int(device['default_sample_rate'])
-                self.channels = min(2, device['input_channels'])
-                self.sound_in_id = device['index']
-                self.sound_in_chs = self.channels
-                self.PRIMARY_IN_SAMPLERATE = self.samplerate
-                print(f"Fallback audio device: {self.device_index} at {self.samplerate}Hz ({self.channels} channels)")
-                return True
-            
-            # If we get here, no audio devices were found
-            raise RuntimeError("No suitable audio devices found. Please check your audio hardware and drivers.")
-            
+            configured_name = _cfg_mod.DEVICE_NAME_FOR_PLATFORM()
+        except Exception:
+            configured_name = None
+
+        # Desired params from config (prefer module config first)
+        cfg_mod = getattr(self, "config", None)
+        desired_rate = int(getattr(cfg_mod, "PRIMARY_IN_SAMPLERATE",
+                                   getattr(self, "PRIMARY_IN_SAMPLERATE", 44100)) if cfg_mod else getattr(self, "PRIMARY_IN_SAMPLERATE", 44100))
+        desired_ch = int(getattr(cfg_mod, "SOUND_IN_CHS",
+                                 getattr(self, "SOUND_IN_CHS", 1)) if cfg_mod else getattr(self, "SOUND_IN_CHS", 1))
+
+        # 1) Select a device (do not trust samplerate/channels from selection)
+        try:
+            info = find_device_by_config(
+                strict=bool(configured_name),
+                desired_samplerate=desired_rate,
+                desired_channels=desired_ch,
+            )
         except Exception as e:
-            logging.error(f"Audio initialization error: {e}")
-            print(f"FATAL: Audio initialization failed - {e}")
+            if configured_name:
+                logging.error("Config-based device configuration failed (strict): %s", e)
+                return False
+            logging.info("Config-based device configuration failed, trying fallback: %s", e)
+            info = None
+
+        if not info and not configured_name:
+            try:
+                info = get_audio_device_config(
+                    strict=False,
+                    desired_samplerate=desired_rate,
+                    desired_channels=desired_ch,
+                )
+            except Exception as e:
+                logging.error("Fallback audio configuration failed: %s", e)
+                info = None
+
+        if not info:
+            logging.error("Audio initialization error: No suitable audio devices found. Please check your audio hardware and drivers.")
             return False
+
+        # 2) Enforce desired sample rate if the device supports it; else fallback
+        idx = int(info["index"])
+        self.device_index = idx
+        self.channels = desired_ch  # prefer config channels
+        effective_rate = desired_rate
+
+        try:
+            # Validate requested rate against the device
+            sd.check_input_settings(device=idx, samplerate=desired_rate, channels=desired_ch, dtype='int16')
+        except Exception as e:
+            # Fallback to device default rate when requested is unsupported
+            try:
+                dev = sd.query_devices(idx)
+                dev_default_rate = int(dev.get("default_samplerate") or 0)
+            except Exception:
+                dev_default_rate = 0
+            fallback_rate = dev_default_rate if dev_default_rate > 0 else int(info.get("samplerate", 48000))
+            logging.warning("Requested samplerate %d not supported on device %s. Falling back to %d. Error: %s",
+                            desired_rate, info.get("name", idx), fallback_rate, e)
+            effective_rate = int(fallback_rate)
+
+        # Persist final selection
+        self.samplerate = effective_rate
+        # Keep legacy and new channel fields in sync for downstream buffer usage
+        self.sound_in_chs = int(self.channels)
+
+        # 3) Log final choice using our effective params (not selection defaults)
+        try:
+            dev = sd.query_devices(idx)
+            hostapis = sd.query_hostapis()
+            hostapi_name = None
+            try:
+                hostapi_idx = int(dev.get("hostapi", -1))
+                hostapi_name = hostapis[hostapi_idx]["name"] if 0 <= hostapi_idx < len(hostapis) else None
+            except Exception:
+                hostapi_name = None
+            logging.info("Using input device [%d] %s via %s @ %d Hz (%d ch)",
+                         idx,
+                         dev.get("name", info.get("name", "Unknown")),
+                         hostapi_name or info.get("api_name", "Unknown API"),
+                         self.samplerate,
+                         self.channels)
+        except Exception:
+            logging.info("Using input device [%d] %s @ %d Hz (%d ch)",
+                         idx, info.get("name", "Unknown"), self.samplerate, self.channels)
+
+        return True
 
     def should_start_auto_recording(self):
         """Check if automatic recording should be started based on config."""
@@ -251,9 +362,9 @@ class BmarApp:
 
     def setup_audio_circular_buffer(self):
         """Set up the circular buffer for audio recording."""
-        # Calculate buffer size and initialize buffer
-        self.buffer_size = int(self.BUFFER_SECONDS * self.PRIMARY_IN_SAMPLERATE)
-        self.buffer = np.zeros((self.buffer_size, self.sound_in_chs), dtype=self._dtype)
+        # Use actual selected samplerate/channels
+        self.buffer_size = int(self.BUFFER_SECONDS * int(self.samplerate))
+        self.buffer = np.zeros((self.buffer_size, int(self.sound_in_chs)), dtype=np.int16)
         self.buffer_index = 0
         self.buffer_wrap = False
         self.blocksize = 8196
@@ -279,7 +390,94 @@ class BmarApp:
             logging.error(f"Failed to start automatic recording: {e}")
             return False
 
+    def _ensure_vu_window_len(self, block_len: int):
+        """
+        Ensure the VU window length matches config latency and current block duration.
+        Called on first update and whenever block size changes.
+        """
+        try:
+            latency_ms = int(getattr(self.config, "VU_METER_LATENCY_MS", 120))
+        except Exception:
+            latency_ms = 120
+        sr = max(1, int(self.samplerate or 48000))
+        block_len = max(1, int(block_len or self.blocksize or 1024))
+        block_dt = block_len / float(sr)
+        # number of blocks to roughly match latency_ms
+        target_len = max(1, int(round((latency_ms / 1000.0) / block_dt)))
+        if target_len != self._vu_window_len:
+            self._vu_window = deque(maxlen=target_len)
+            self._vu_window_len = target_len
 
+    @staticmethod
+    def _rms_dbfs(samples: np.ndarray) -> float:
+        """Compute RMS in dBFS from floating samples (-1..1)."""
+        if samples is None or samples.size == 0:
+            return -120.0
+        # If int types, convert to float -1..1
+        if np.issubdtype(samples.dtype, np.integer):
+            info = np.iinfo(samples.dtype)
+            x = samples.astype(np.float32) / max(1.0, float(info.max))
+        else:
+            x = samples.astype(np.float32)
+        # Avoid NaN/Inf
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        rms = np.sqrt(np.mean(np.square(x))) if x.size else 0.0
+        if rms <= 1e-9:
+            return -120.0
+        db = 20.0 * np.log10(min(1.0, max(1e-9, float(rms))))
+        return float(db)
+
+    def update_vu_from_block(self, block: np.ndarray) -> float:
+        """
+        Update the VU meter from an audio block and return smoothed dBFS for UI.
+        - Averages recent block dB values over VU_METER_LATENCY_MS.
+        - Applies exponential dampening using VU_METER_DAMPING.
+        """
+        # Ensure we know target window length from this block size
+        try:
+            block_len = block.shape[0] if hasattr(block, "shape") and len(block.shape) > 0 else len(block)
+        except Exception:
+            block_len = self.blocksize or 1024
+        self._ensure_vu_window_len(block_len)
+
+        # Compute block dBFS (mono RMS across channels)
+        try:
+            if block.ndim == 2 and block.shape[1] > 1:
+                # mixdown to mono for VU
+                mono = np.mean(block, axis=1)
+            else:
+                mono = block.reshape(-1)
+        except Exception:
+            mono = np.asarray(block, dtype=np.float32).reshape(-1)
+
+        current_db = self._rms_dbfs(mono)
+        self.vu_level_db = current_db
+
+        # Windowed average for latency
+        self._vu_window.append(current_db)
+        avg_db = float(np.mean(self._vu_window)) if len(self._vu_window) > 0 else current_db
+
+        # Exponential dampening
+        try:
+            damping = float(getattr(self.config, "VU_METER_DAMPING", 0.85))
+        except Exception:
+            damping = 0.85
+        damping = min(0.99, max(0.0, damping))
+        alpha = 1.0 - damping
+        self.vu_level_db_smooth = (damping * self.vu_level_db_smooth) + (alpha * avg_db)
+        return self.vu_level_db_smooth
+
+    def vu_percent(self, floor_db: float = -60.0) -> float:
+        """
+        Convert the current smoothed VU dBFS to 0..1 for UI bars.
+        floor_db defines the lowest visible value (e.g., -60 dBFS).
+        """
+        db = float(self.vu_level_db_smooth)
+        if db <= floor_db:
+            return 0.0
+        if db >= 0.0:
+            return 1.0
+        return (db - floor_db) / (0.0 - floor_db)
 
     def run(self):
         """Main application run loop."""
@@ -404,7 +602,7 @@ class BmarApp:
             os.makedirs(self.recording_dir, exist_ok=True)
             
             # Create today's directory
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
             self.today_dir = os.path.join(self.recording_dir, today)
             os.makedirs(self.today_dir, exist_ok=True)
             
@@ -423,6 +621,20 @@ class BmarApp:
         print(text)
         if suffix_newline:
             print("")
+
+    def _save_raw_capture(self, filepath: str, audio_block: np.ndarray, block_sr: int):
+        """Save a raw audio capture to file with optional resampling and bit depth conversion."""
+        try:
+            # Resample and convert bit depth if target settings are defined
+            target_sr = getattr(self, "PRIMARY_SAVE_SAMPLERATE",
+                                getattr(self.config, "PRIMARY_SAVE_SAMPLERATE", None))
+            bitdepth = getattr(self, "PRIMARY_BITDEPTH",
+                               getattr(self.config, "PRIMARY_BITDEPTH", 16))
+            save_flac_with_target_sr(filepath, audio_block, in_samplerate=block_sr,
+                                     target_samplerate=target_sr, bitdepth=bitdepth)
+        except Exception as e:
+            logging.error(f"Error saving raw capture to {filepath}: {e}")
+            raise
 
 def create_bmar_app():
     """Create and initialize a BMAR application instance."""
@@ -465,3 +677,9 @@ def run_bmar_application():
 if __name__ == "__main__":
     """Allow the module to be run directly for testing."""
     sys.exit(run_bmar_application())
+
+'''
+__init__.py no longer triggers bmar_app at package import time, so importing modules.file_utils doesn’t re-enter bmar_app.
+bmar_app imports file_utils in a package-qualified way and doesn’t suppress real import-time errors.
+file_utils.py is now complete and importable.
+'''

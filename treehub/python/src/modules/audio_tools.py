@@ -3,16 +3,110 @@ BMAR Audio Tools Module - SOUNDDEVICE VERSION
 Contains VU meter, intercom monitoring, and audio diagnostic utilities.
 """
 
+from typing import Optional
+import math
 import numpy as np
-import time
-import sounddevice as sd
-import sys
-from .audio_conversion import downsample_audio
-import traceback
+import soundfile as sf
+from typing import Optional
 from collections import deque
-import random
+import sounddevice as sd
+import time
+import sys
+import traceback
 import select
-if sys.platform == "win32": import msvcrt
+try:
+    import msvcrt  # Windows-only keyboard helper (used in intercom loops)
+except Exception:
+    msvcrt = None
+import random
+
+# Helpers to normalize to/from float for resampling only
+def _to_float_norm(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    if np.issubdtype(x.dtype, np.integer):
+        if x.dtype == np.int16:
+            return (x.astype(np.float32) / 32768.0)
+        elif x.dtype == np.int32:
+            return (x.astype(np.float32) / 2147483648.0)
+        else:
+            # Fallback: scale by max of dtype
+            maxv = float(np.iinfo(x.dtype).max)
+            return (x.astype(np.float32) / maxv) if maxv else x.astype(np.float32)
+    # assume already -1..1 float
+    return x.astype(np.float32, copy=False)
+
+def _from_float_to_int16(x: np.ndarray) -> np.ndarray:
+    y = np.asarray(x, dtype=np.float32)
+    y = np.clip(y, -1.0, 1.0) * 32767.0
+    return np.asarray(np.rint(y), dtype=np.int16)
+
+# High-quality resampling helper (already used for FLAC); keep near top-level
+def _resample_linear(data: np.ndarray, in_sr: int, out_sr: int, axis: int = 0) -> np.ndarray:
+    if int(in_sr) == int(out_sr):
+        return data
+    n_in = data.shape[axis]
+    n_out = int(round(n_in * (int(out_sr) / float(int(in_sr)))))
+    if n_in <= 1 or n_out <= 1:
+        return data
+    x_old = np.linspace(0.0, 1.0, num=n_in, endpoint=True, dtype=np.float64)
+    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=True, dtype=np.float64)
+    x = np.moveaxis(np.asarray(data), axis, 0).astype(np.float32, copy=False)
+    if x.ndim == 1:
+        y = np.interp(x_new, x_old, x).astype(np.float32)
+    else:
+        y = np.vstack([np.interp(x_new, x_old, x[:, ch]) for ch in range(x.shape[1])]).T.astype(np.float32)
+    return np.moveaxis(y, 0, axis)
+
+def _resample_poly_or_linear(data: np.ndarray, in_sr: int, out_sr: int, axis: int = 0) -> np.ndarray:
+    if int(in_sr) == int(out_sr):
+        return data
+    try:
+        from scipy.signal import resample_poly
+        g = math.gcd(int(out_sr), int(in_sr))
+        up = int(out_sr // g)
+        down = int(in_sr // g)
+        x = np.moveaxis(np.asarray(data), axis, 0).astype(np.float32, copy=False)
+        y = resample_poly(x, up=up, down=down, axis=0).astype(np.float32, copy=False)
+        return np.moveaxis(y, 0, axis)
+    except Exception:
+        return _resample_linear(data, in_sr, out_sr, axis=axis)
+
+# Public helpers used by intercom code
+def resample_audio(data: np.ndarray, in_sr: int, out_sr: int) -> np.ndarray:
+    """Resample audio frames along time axis (axis=0)."""
+    return _resample_poly_or_linear(np.asarray(data), int(in_sr), int(out_sr), axis=0)
+
+def downsample_audio(data: np.ndarray, in_sr: int, out_sr: int) -> np.ndarray:
+    """Alias for resample_audio; kept for backward compatibility."""
+    return resample_audio(data, in_sr, out_sr)
+
+def upsample_audio(data: np.ndarray, in_sr: int, out_sr: int) -> np.ndarray:
+    """Alias for resample_audio; kept for backward compatibility."""
+    return resample_audio(data, in_sr, out_sr)
+
+def save_flac_with_target_sr(path: str,
+                             data: np.ndarray,
+                             in_samplerate: int,
+                             target_samplerate: Optional[int],
+                             bitdepth: int = 16) -> None:
+    """
+    Save audio to FLAC at target_samplerate if provided; otherwise use in_samplerate.
+    - data: shape (frames,) or (frames, channels), dtype float32/float64/int16/int32
+    - bitdepth: 16 or 24 controls FLAC subtype
+    """
+    if target_samplerate and int(target_samplerate) != int(in_samplerate):
+        data = _resample_poly_or_linear(np.asarray(data), int(in_samplerate), int(target_samplerate), axis=0)
+        sr = int(target_samplerate)
+    else:
+        sr = int(in_samplerate)
+
+    subtype = "PCM_16" if int(bitdepth) <= 16 else "PCM_24"
+    # SoundFile accepts float32 for FLAC; ensure finite values
+    x = np.asarray(data)
+    if np.issubdtype(x.dtype, np.integer):
+        x = x.astype(np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    sf.write(path, x, sr, format="FLAC", subtype=subtype)
 
 
 # Notes for VU meter tuning (config keys):
@@ -61,6 +155,13 @@ def _vu_meter_from_buffer(app, config, stop_event=None):
     try:
         sr = int(getattr(app, 'PRIMARY_IN_SAMPLERATE', config.get('samplerate', 44100)))
         channels = int(getattr(app, 'sound_in_chs', config.get('channels', 1)))
+        # Announce the initial monitored channel once
+        try:
+            _mon0 = int(getattr(app, 'monitor_channel', config.get('monitor_channel', 0)))
+            _mon0 = 0 if _mon0 < 0 else min(_mon0, max(1, channels) - 1)
+            print(f"VU meter: monitoring channel {(_mon0 + 1)} of {max(1, channels)}")
+        except Exception:
+            pass
 
         # Window length for RMS calculation and UI update cadence
         update_interval = 0.05  # ~20 Hz UI updates
@@ -75,6 +176,16 @@ def _vu_meter_from_buffer(app, config, stop_event=None):
 
         max_hist_len = max(1, int(hist_seconds / max(1e-3, update_interval)))
         rms_db_hist = deque(maxlen=max_hist_len)
+
+        # Smoothing params
+        latency_ms = int(config.get('VU_METER_LATENCY_MS', 150))
+        damping = float(config.get('VU_METER_DAMPING', 0.90))
+        damping = min(0.99, max(0.0, damping))
+        # Approximate blocks per latency using current analysis window as block
+        block_dt = max(1e-6, n_win / float(sr))
+        window_len = max(1, int(round((latency_ms / 1000.0) / block_dt)))
+        vu_window = deque(maxlen=window_len)
+        smooth_db = -120.0
 
         # Main UI loop
         while True:
@@ -146,7 +257,16 @@ def _vu_meter_from_buffer(app, config, stop_event=None):
                 min_db = min(min_db, -5.0)  # never push min above -5 dB
                 max_db = min_db + max(6.0, dyn_range_db)  # at least 6 dB span
 
-                _display_vu_meter(db, rms, min_db=min_db, max_db=max_db)
+                # --- VU METER SMOOTHING AND DISPLAY ---
+                # Use the instantaneous dB just computed (db), then smooth it
+                inst_db = float(db)
+                vu_window.append(inst_db)
+                avg_db = float(np.mean(vu_window)) if len(vu_window) > 0 else inst_db
+                alpha = 1.0 - damping
+                smooth_db = (damping * smooth_db) + (alpha * avg_db)
+
+                # Display smoothed dB within dynamic range
+                _display_vu_meter(smooth_db, rms, min_db=min_db, max_db=max_db)
                 time.sleep(update_interval)
 
             except (IndexError, ValueError, AttributeError, RuntimeError):
@@ -165,9 +285,9 @@ def _vu_meter_sounddevice(config, stop_event=None):
     
     try:
         device_index = config.get('device_index')
-        samplerate = config.get('samplerate', 44100)
-        channels = config.get('channels', 1)
-        blocksize = config.get('blocksize', 256)  # Smaller buffer for faster updates
+        samplerate = int(config.get('samplerate', 44100))
+        channels = int(config.get('channels', 1))
+        blocksize = int(config.get('blocksize', 256))  # Smaller buffer for faster updates
         monitor_channel = config.get('monitor_channel', 0)
         
         # Force smaller blocksize for responsive VU meter
@@ -183,13 +303,33 @@ def _vu_meter_sounddevice(config, stop_event=None):
             if monitor_channel >= actual_channels:
                 print(f"Channel {monitor_channel + 1} not available, using channel 1")
                 monitor_channel = 0
+            # Announce initial channel selection
+            try:
+                print(f"VU meter: monitoring channel {monitor_channel + 1} of {max(1, actual_channels)}")
+            except Exception:
+                pass
                 
         except (sd.PortAudioError, ValueError) as e:
             print(f"Error getting device info: {e}")
             actual_channels = channels
         
-        # Global variable to track VU meter data and state
-        vu_data = {'db_level': -80, 'rms_level': 0.0, 'callback_active': True}
+        # Smoothing params and state
+        try:
+            latency_ms = int(config.get('VU_METER_LATENCY_MS', 150))
+        except Exception:
+            latency_ms = 150
+        try:
+            damping = float(config.get('VU_METER_DAMPING', 0.90))
+        except Exception:
+            damping = 0.90
+        damping = min(0.99, max(0.0, damping))
+        block_dt = max(1e-6, blocksize / float(samplerate))
+        window_len = max(1, int(round((latency_ms / 1000.0) / block_dt)))
+        vu_window = deque(maxlen=window_len)
+        smooth_db = -120.0
+
+        # Shared data for callback
+        vu_data = {'db_level': -80.0, 'rms_level': 0.0, 'callback_active': True}
         
         # Audio callback for VU meter
         def audio_callback(indata, _frames, _time_info, _status):
@@ -218,8 +358,8 @@ def _vu_meter_sounddevice(config, stop_event=None):
                 else:
                     db_level = -80
                 
-                # Update global data
-                vu_data['db_level'] = db_level
+                # Update shared data
+                vu_data['db_level'] = float(db_level)
                 vu_data['rms_level'] = rms_level
                 
             except sd.CallbackStop:
@@ -237,7 +377,7 @@ def _vu_meter_sounddevice(config, stop_event=None):
             channels=actual_channels,
             samplerate=int(samplerate),
             blocksize=blocksize,
-            dtype='float32',
+            dtype='int16',
             callback=audio_callback
         ):
             try:
@@ -250,8 +390,13 @@ def _vu_meter_sounddevice(config, stop_event=None):
                     if not vu_data['callback_active']:
                         break
                     
-                    # Display VU meter
-                    _display_vu_meter(vu_data['db_level'], vu_data['rms_level'])
+                    # Smooth and display
+                    inst_db = float(vu_data['db_level'])
+                    vu_window.append(inst_db)
+                    avg_db = float(np.mean(vu_window)) if len(vu_window) > 0 else inst_db
+                    alpha = 1.0 - damping
+                    smooth_db = (damping * smooth_db) + (alpha * avg_db)
+                    _display_vu_meter(smooth_db, vu_data['rms_level'])
                     time.sleep(0.05)  # Update display at ~20Hz
                     
             except KeyboardInterrupt:
@@ -276,9 +421,12 @@ def _vu_meter_virtual(config, stop_event=None):
     
     try:
         # Access config for completeness and future use
-        _ = config.get('monitor_channel', 0)
+        _mon = int(config.get('monitor_channel', 0))
+        try:
+            print(f"VU meter (virtual): monitoring channel {_mon + 1}")
+        except Exception:
+            pass
 
-        
         try:
             while True:
                 # Check for stop event instead of keyboard input
@@ -316,62 +464,47 @@ def _vu_meter_virtual(config, stop_event=None):
         traceback.print_exc()
 
 
-def _display_vu_meter(db_level, rms_level, min_db=-60.0, max_db=0.0):
-    """Display VU meter bar with configurable dB range.
-    db_level: measured level in dBFS
-    rms_level: measured RMS in linear units
-    min_db/max_db: mapping range for full-scale bar utilization
-    """
-    
+def _display_vu_meter(db_level, rms_level, min_db: float = -60.0, max_db: float = 0.0):
+    """Display VU meter bar with configurable dB range."""
     try:
-        # Ensure valid range
-        if max_db <= min_db:
-            max_db = min_db + 40.0
-        
-        # Clamp dB level to range
-        clamped_db = max(min_db, min(max_db, db_level))
-        
-        # Create meter bar (50 characters wide)
+        db = float(db_level)
+        rms = float(rms_level)
+        lo = float(min_db)
+        hi = float(max_db)
+        if hi <= lo:
+            hi = lo + 40.0
+
+        clamped_db = max(lo, min(hi, db))
         meter_width = 50
-        
-        # Map dB level to meter position (min_db..max_db -> 0..meter_width)
-        span = (max_db - min_db) if (max_db - min_db) > 1e-6 else 1.0
-        meter_pos = int((clamped_db - min_db) / span * meter_width)
+        span = (hi - lo) if (hi - lo) > 1e-6 else 1.0
+        meter_pos = int((clamped_db - lo) / span * meter_width)
         meter_pos = max(0, min(meter_width, meter_pos))
-        
-        # Create the meter bar
-        green_zone = int(meter_width * 0.7)   # 70% green
-        yellow_zone = int(meter_width * 0.9)  # 20% yellow
-        # Remaining 10% is red
-        
+
+        green_zone = int(meter_width * 0.7)
+        yellow_zone = int(meter_width * 0.9)
         meter_bar = ""
         for i in range(meter_width):
             if i < meter_pos:
-                if i < green_zone:
-                    meter_bar += "█"  # Green zone
-                elif i < yellow_zone:
-                    meter_bar += "▆"  # Yellow zone  
-                else:
-                    meter_bar += "▅"  # Red zone
+                meter_bar += "█" if i < green_zone else ("▆" if i < yellow_zone else "▅")
             else:
                 meter_bar += "·"
-        
-        # Format the display (show measured dB and mapping range)
-        level_display = f"[{meter_bar}] {db_level:5.1f}dB (RMS: {rms_level:.4f})"
-        range_display = f" [{min_db:4.0f}..{max_db:3.0f} dB]"
-        
-        # Print with carriage return to overwrite previous line
-        print(f"\rVU: {level_display}{range_display}", end="", flush=True)
-        
+
+        print(f"\rVU: [{meter_bar}] {db:5.1f}dB (RMS: {rms:.4f}) [{lo:4.0f}..{hi:3.0f} dB]", end="", flush=True)
     except (ValueError, TypeError) as e:
-        print(f"Display error: {e}")
+        print(f"\rDisplay error: {e}", end="", flush=True)
 
 
-def intercom_m(config):
-    """Microphone monitoring - route input to output (intercom).
-    Prefer tapping the existing circular buffer if available (no input device handle).
+def intercom_m(config, stop_event=None):
     """
-    
+    Intercom monitor loop.
+    - config: dict with keys: output_device, samplerate, channels, blocksize, gain, monitor_channel, bit_depth
+    - stop_event: threading.Event or multiprocessing.Event to request shutdown
+    """
+    # Provide a no-op event if none supplied
+    class _DummyEvt:
+        def is_set(self): return False
+    stop_event = stop_event or _DummyEvt()
+
     input_device = config.get('input_device')
     output_device = config.get('output_device', input_device)
     samplerate = int(config.get('samplerate', 48000))
@@ -381,7 +514,6 @@ def intercom_m(config):
     monitor_channel = int(config.get('monitor_channel', 0))
     bit_depth = int(config.get('bit_depth', 16))
 
-    # Suppress prints if VU meter is active
     vu_meter_active = bool(config.get('vu_meter_active', False))
 
     # If the shared buffer exists, use it for monitoring
@@ -390,11 +522,10 @@ def intercom_m(config):
         app_ref = getattr(audio_processing.callback, 'app', None)
     except (ImportError, AttributeError, NameError):
         app_ref = None
-    # Allow explicit app object in config to force buffer path
     app_ref = config.get('app', app_ref)
 
     if app_ref is not None and getattr(app_ref, 'buffer', None) is not None:
-        return _intercom_from_buffer(app_ref, config)
+        return _intercom_from_buffer(app_ref, config, stop_event)  # pass stop_event through
 
     # Helper: check and resolve a valid output device
     def _is_output_device(dev):
@@ -446,13 +577,11 @@ def intercom_m(config):
         out_info = sd.query_devices(resolved_output_device, 'output')
         in_channels = max(1, min(in_channels_req, int(in_info['max_input_channels'])))
         out_channels = max(1, int(out_info['max_output_channels']))
-        # Use up to 2 output channels for monitoring
         out_channels = 2 if out_channels >= 2 else 1
 
         if monitor_channel < 0 or monitor_channel >= in_channels:
             monitor_channel = 0
 
-        # dtype
         dtype = 'int16' if bit_depth == 16 else 'float32'
 
         if not vu_meter_active:
@@ -464,19 +593,18 @@ def intercom_m(config):
             print("Press 'i' again to stop from main UI.")
 
         def callback(indata, outdata, frames, _time, status):
-            # Use frames to avoid unused-var warnings
+            # Stop immediately if requested
+            if stop_event and stop_event.is_set():
+                raise sd.CallbackStop()
             _ = frames
             if status:
-                # Keep silent on minor glitches
                 pass
             try:
-                # Extract selected input channel
                 if in_channels > 1:
                     x = indata[:, monitor_channel]
                 else:
                     x = indata[:, 0]
 
-                # Convert to float for gain and clip
                 if indata.dtype == np.int16:
                     y = x.astype(np.float32)
                     y *= gain
@@ -488,7 +616,6 @@ def intercom_m(config):
                         outdata[:, 0] = y16
                         outdata[:, 1] = y16
                 else:
-                    # float32 pipeline
                     y = x.astype(np.float32) * gain
                     y = np.clip(y, -1.0, 1.0)
                     if out_channels == 1:
@@ -497,10 +624,8 @@ def intercom_m(config):
                         outdata[:, 0] = y
                         outdata[:, 1] = y
             except (ValueError, RuntimeError, IndexError, TypeError):
-                # On any error, output silence to avoid noise
                 outdata.fill(0)
 
-        # Use full-duplex stream
         with sd.Stream(
             device=(input_device, resolved_output_device),
             samplerate=samplerate,
@@ -510,9 +635,10 @@ def intercom_m(config):
             callback=callback
         ):
             try:
-                # Keep process alive; allow user input to stop when attached to a console
-
+                # Exit on stop_event or Enter key (for standalone mode)
                 while True:
+                    if stop_event and stop_event.is_set():
+                        break
                     if sys.platform == "win32":
                         try:
                             if msvcrt.kbhit():
@@ -528,12 +654,11 @@ def intercom_m(config):
                                 if _ in ('\n', '\r'):
                                     break
                         except (OSError, ValueError):
-                            # Likely no TTY; ignore
                             pass
-                    time.sleep(0.1)
+                    time.sleep(0.05)
             except KeyboardInterrupt:
                 pass
-        
+
         if not vu_meter_active:
             print("Intercom stopped")
 
@@ -543,10 +668,15 @@ def intercom_m(config):
         traceback.print_exc()
 
 
-def _intercom_from_buffer(app, config):
+def _intercom_from_buffer(app, config, stop_event=None):
     """Local monitor by reading from the capture circular buffer and resampling to playback.
     Avoids opening any input stream. Supports dynamic channel switching via app.monitor_channel.
     """
+    # Provide a no-op event if none supplied
+    class _DummyEvt:
+        def is_set(self): return False
+    stop_event = stop_event or _DummyEvt()
+
     # Config
     output_device = config.get('output_device')
     out_sr = int(config.get('samplerate', 48000))
@@ -610,10 +740,8 @@ def _intercom_from_buffer(app, config):
             print(f"Starting intercom (buffer): out_dev={out_name} sr={out_sr} out_ch={out_channels} (src_sr={in_sr})")
             print("Press 'i' again to stop from main UI.")
 
-        # Callback: fill output from the latest buffer audio
         def callback(outdata, frames, _time, status):
             if status:
-                # ignore minor glitches
                 pass
             try:
                 buf = getattr(app, 'buffer', None)
@@ -688,11 +816,9 @@ def _intercom_from_buffer(app, config):
                 else:
                     outdata[:, 0] = y
                     outdata[:, 1] = y
-
             except (ValueError, RuntimeError, IndexError, TypeError):
                 outdata.fill(0)
 
-        # Use output-only stream
         with sd.OutputStream(
             device=out_dev,
             samplerate=out_sr,
@@ -703,6 +829,8 @@ def _intercom_from_buffer(app, config):
         ):
             try:
                 while True:
+                    if stop_event and stop_event.is_set():
+                        break
                     if sys.platform == "win32":
                         try:
                             if msvcrt.kbhit():
@@ -719,7 +847,7 @@ def _intercom_from_buffer(app, config):
                                     break
                         except (OSError, ValueError):
                             pass
-                    time.sleep(0.1)
+                    time.sleep(0.05)
             except KeyboardInterrupt:
                 pass
 
@@ -862,3 +990,86 @@ def create_progress_bar(current, total, width=40):
     percentage = int(progress * 100)
     
     return f"[{bar}] {percentage}%"
+
+def _rms_dbfs(samples: np.ndarray) -> float:
+    """Compute RMS in dBFS (-120..0) from mono float/int samples."""
+    if samples is None or samples.size == 0:
+        return -120.0
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        x = samples.astype(np.float32) / max(1.0, float(info.max))
+    else:
+        x = samples.astype(np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    rms = float(np.sqrt(np.mean(np.square(x)))) if x.size else 0.0
+    return -120.0 if rms <= 1e-9 else float(20.0 * np.log10(min(1.0, max(1e-9, rms))))
+
+def _db_to_percent(db: float, floor_db: float = -60.0) -> float:
+    if db <= floor_db:
+        return 0.0
+    if db >= 0.0:
+        return 1.0
+    return (db - floor_db) / (0.0 - floor_db)
+
+def _vu_meter_dummy():
+    """Removed stray token fix: placeholder to avoid syntax errors."""
+    return None
+
+# Global FLAC save override: preserves integer PCM for FLAC
+_ORIGINAL_SF_WRITE = None
+_FLAC_TARGET_SR: Optional[int] = None
+
+def set_global_flac_target_samplerate(sr: Optional[int]) -> None:
+    """
+    Set a global target sample rate for all FLAC writes. If set and different
+    from the provided samplerate, audio is resampled before saving.
+    FLAC writes are always integer PCM (PCM_16 by default).
+    """
+    global _FLAC_TARGET_SR, _ORIGINAL_SF_WRITE
+    _FLAC_TARGET_SR = int(sr) if sr is not None else None
+
+    if _ORIGINAL_SF_WRITE is None:
+        _ORIGINAL_SF_WRITE = sf.write
+
+        def _patched_sf_write(file, data, samplerate, subtype=None, format=None, endian=None, closefd=True):
+            try:
+                fmt = format
+                # Infer format from filename if format is None
+                if fmt is None and isinstance(file, (str, bytes, bytearray)):
+                    if str(file).lower().endswith(".flac"):
+                        fmt = "FLAC"
+
+                if fmt == "FLAC":
+                    target_sr = _FLAC_TARGET_SR
+                    in_sr = int(samplerate)
+                    # Default to PCM_16 unless caller specified otherwise
+                    out_subtype = subtype or "PCM_16"
+
+                    x = np.asarray(data)
+
+                    # If resampling is required, normalize -> resample -> back to int16
+                    if target_sr and int(target_sr) != in_sr:
+                        xf = _to_float_norm(x)
+                        yr = _resample_poly_or_linear(xf, in_sr, int(target_sr), axis=0)
+                        x_out = _from_float_to_int16(yr)
+                        return _ORIGINAL_SF_WRITE(file, x_out, int(target_sr),
+                                                  subtype="PCM_16", format="FLAC", endian=endian, closefd=closefd)
+
+                    # No resample: if integer, write as-is; if float, convert to int16 first
+                    if np.issubdtype(x.dtype, np.integer):
+                        return _ORIGINAL_SF_WRITE(file, x, in_sr,
+                                                  subtype=out_subtype, format="FLAC", endian=endian, closefd=closefd)
+                    else:
+                        x_out = _from_float_to_int16(x)
+                        return _ORIGINAL_SF_WRITE(file, x_out, in_sr,
+                                                  subtype="PCM_16", format="FLAC", endian=endian, closefd=closefd)
+
+                # Non-FLAC: default behavior untouched
+                return _ORIGINAL_SF_WRITE(file, data, samplerate,
+                                          subtype=subtype, format=format, endian=endian, closefd=closefd)
+            except Exception:
+                # On any error, fall back to original to avoid losing data
+                return _ORIGINAL_SF_WRITE(file, data, samplerate,
+                                          subtype=subtype, format=format, endian=endian, closefd=closefd)
+
+        sf.write = _patched_sf_write
